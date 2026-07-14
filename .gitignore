@@ -1,0 +1,20 @@
+# Build output
+build/
+*.exe
+*.o
+*.obj
+*.a
+*.lib
+*.dll
+
+# Generated test images / LUTs
+*.ppm
+*.pgm
+grad.ppm
+out.ppm
+cf_test_*.cube
+
+# Editor / OS
+.vs/
+.vscode/
+.DS_Store

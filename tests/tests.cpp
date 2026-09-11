@@ -1,4 +1,4 @@
-// chromaforge/tests/tests.cpp — dependency-free unit tests with real assertions.
+﻿// chromaforge/tests/tests.cpp â€” dependency-free unit tests with real assertions.
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -176,6 +176,79 @@ static void testThreadPoolCorrectness() {
     CHECK(sum == static_cast<long long>(n) * (n - 1) / 2);
 }
 
+// The lookup-table fast paths below replaced per-pixel float math. An optimization that
+// changes output is a bug, so each is compared against the arithmetic it is meant to
+// replace, evaluated independently here over every reachable input byte.
+
+static void testExposureMatchesReference(ThreadPool& pool) {
+    std::printf("test: exposure LUT matches per-pixel reference\n");
+    for (float stops : {-2.0f, -0.5f, 0.0f, 1.0f, 2.5f}) {
+        Image img = makeGradient(97, 61);
+        Image expected = img;
+        const float scale = std::pow(2.0f, stops);
+        for (size_t i = 0; i < expected.byteCount(); ++i)
+            expected.data()[i] = clampByte(static_cast<float>(expected.data()[i]) * scale);
+        color::exposure(img, pool, stops);
+        CHECK(maxAbsDiff(img, expected) == 0);
+    }
+}
+
+static void testBrightnessContrastMatchesReference(ThreadPool& pool) {
+    std::printf("test: brightness/contrast LUT matches per-pixel reference\n");
+    const float cases[][2] = {{0.0f, 1.0f}, {0.25f, 1.0f}, {-0.2f, 1.6f}, {0.1f, 0.4f}};
+    for (const auto& c : cases) {
+        Image img = makeGradient(83, 55);
+        Image expected = img;
+        const float offset = c[0] * 255.0f;
+        for (size_t i = 0; i < expected.byteCount(); ++i) {
+            const float v = (static_cast<float>(expected.data()[i]) - 128.0f) * c[1] + 128.0f + offset;
+            expected.data()[i] = clampByte(v);
+        }
+        color::brightnessContrast(img, pool, c[0], c[1]);
+        CHECK(maxAbsDiff(img, expected) == 0);
+    }
+}
+
+static void testWhiteBalanceMatchesReference(ThreadPool& pool) {
+    std::printf("test: white balance LUT matches per-pixel reference\n");
+    const float cases[][2] = {{0.0f, 0.0f}, {0.4f, 0.1f}, {-0.6f, 0.3f}};
+    for (const auto& c : cases) {
+        Image img = makeGradient(71, 49);
+        Image expected = img;
+        const float gr = 1.0f + 0.5f * c[0];
+        const float gg = 1.0f + 0.5f * c[1];
+        const float gb = 1.0f - 0.5f * c[0];
+        const int w = expected.width();
+        for (int y = 0; y < expected.height(); ++y) {
+            uint8_t* p = expected.row(y);
+            for (int x = 0; x < w; ++x) {
+                p[x * 3 + 0] = clampByte(p[x * 3 + 0] * gr);
+                p[x * 3 + 1] = clampByte(p[x * 3 + 1] * gg);
+                p[x * 3 + 2] = clampByte(p[x * 3 + 2] * gb);
+            }
+        }
+        color::whiteBalance(img, pool, c[0], c[1]);
+        CHECK(maxAbsDiff(img, expected) == 0);
+    }
+}
+
+static void testIdentityOperatorsArePixelExact(ThreadPool& pool) {
+    std::printf("test: neutral parameters leave the image untouched\n");
+    Image original = makeGradient(64, 64);
+
+    Image a = original;
+    color::exposure(a, pool, 0.0f);
+    CHECK(maxAbsDiff(a, original) == 0);
+
+    Image b = original;
+    color::brightnessContrast(b, pool, 0.0f, 1.0f);
+    CHECK(maxAbsDiff(b, original) == 0);
+
+    Image c = original;
+    color::whiteBalance(c, pool, 0.0f, 0.0f);
+    CHECK(maxAbsDiff(c, original) == 0);
+}
+
 int main() {
     std::printf("chromaforge test suite\n");
     ThreadPool pool(0);
@@ -190,6 +263,10 @@ int main() {
     testSeparableMatchesNaive(pool);
     testBoxBlurConstant(pool);
     testThreadPoolCorrectness();
+    testExposureMatchesReference(pool);
+    testBrightnessContrastMatchesReference(pool);
+    testWhiteBalanceMatchesReference(pool);
+    testIdentityOperatorsArePixelExact(pool);
     std::printf("\n%d checks, %d failures\n", g_checks, g_failures);
     if (g_failures == 0) std::printf("ALL TESTS PASSED\n");
     return g_failures == 0 ? 0 : 1;

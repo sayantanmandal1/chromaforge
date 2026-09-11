@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <functional>
 #include <thread>
+#include <vector>
 
 #include "chromaforge/color.hpp"
 #include "chromaforge/filters.hpp"
@@ -32,12 +33,33 @@ static Image makeImage(int w, int h) {
     return img;
 }
 
-static double timeReps(const std::function<void()>& op, int reps) {
-    op();  // warm-up
+// Mean of a single burst. Kept separate so the outer loop can take a median across bursts.
+static double timeBurst(const std::function<void()>& op, int reps) {
     const auto t0 = Clock::now();
     for (int i = 0; i < reps; ++i) op();
     const auto t1 = Clock::now();
     return std::chrono::duration<double, std::milli>(t1 - t0).count() / reps;
+}
+
+// Median of several independent bursts.
+//
+// A single timing is not reportable on a modern laptop: hybrid P-core/E-core scheduling, turbo
+// residency and thermal state move results by 30-50% between otherwise identical runs. The median
+// rejects the occasional burst that landed on efficiency cores, and the min/max spread is printed
+// so the reader can see how noisy the measurement actually was rather than trusting one number.
+struct Timing {
+    double median;
+    double best;
+    double worst;
+};
+
+static Timing timeReps(const std::function<void()>& op, int reps, int bursts = 5) {
+    op();  // warm-up: first touch, page faults, branch predictor
+    std::vector<double> samples;
+    samples.reserve(static_cast<size_t>(bursts));
+    for (int b = 0; b < bursts; ++b) samples.push_back(timeBurst(op, reps));
+    std::sort(samples.begin(), samples.end());
+    return {samples[samples.size() / 2], samples.front(), samples.back()};
 }
 
 int main(int argc, char** argv) {
@@ -53,41 +75,42 @@ int main(int argc, char** argv) {
     const Image base = makeImage(w, h);
     const int reps = 5;
 
-    std::printf("Separable Gaussian blur (sigma=4) - thread scaling:\n");
+    std::printf("Separable Gaussian blur (sigma=4) - thread scaling (median of 5 bursts):\n");
     double t1 = 0.0;
     for (unsigned t : {1u, 2u, 4u, 8u}) {
         ThreadPool pool(t);
-        const double ms = timeReps(
+        const Timing tm = timeReps(
             [&] {
                 Image r = filters::gaussianBlur(base, pool, 4.0f);
                 g_sink += r.data()[0];
             },
             reps);
-        if (t == 1u) t1 = ms;
-        std::printf("  %2u threads: %8.1f ms   %5.2fx   %7.0f Mpix/s\n", t, ms, t1 / ms,
-                    mpix / (ms / 1000.0));
+        if (t == 1u) t1 = tm.median;
+        std::printf("  %2u threads: %8.1f ms   %5.2fx   %7.0f Mpix/s   [%.0f-%.0f ms]\n", t,
+                    tm.median, t1 / tm.median, mpix / (tm.median / 1000.0), tm.best, tm.worst);
     }
 
     std::printf("\nAlgorithmic optimization (sigma=4, %u threads):\n", hw);
     {
         ThreadPool pool(hw);
-        const double sep = timeReps(
+        const Timing sep = timeReps(
             [&] {
                 Image r = filters::gaussianBlur(base, pool, 4.0f);
                 g_sink += r.data()[0];
             },
             reps);
-        const double naive = timeReps(
+        const Timing naive = timeReps(
             [&] {
                 Image r = filters::gaussianBlurNaive(base, pool, 4.0f);
                 g_sink += r.data()[0];
             },
-            2);
-        std::printf("  separable  O(k)  : %8.1f ms\n", sep);
-        std::printf("  naive 2D   O(k^2): %8.1f ms   -> %.1fx slower\n", naive, naive / sep);
+            2, 3);
+        std::printf("  separable  O(k)  : %8.1f ms\n", sep.median);
+        std::printf("  naive 2D   O(k^2): %8.1f ms   -> %.1fx slower\n", naive.median,
+                    naive.median / sep.median);
     }
 
-    std::printf("\nPer-pixel operator throughput (%u threads):\n", hw);
+    std::printf("\nPer-pixel operator throughput (%u threads, median of 5 bursts):\n", hw);
     {
         ThreadPool pool(hw);
         const Lut3D lut = Lut3D::identity(33);
@@ -95,19 +118,24 @@ int main(int argc, char** argv) {
         const float gam[3] = {1.1f, 1.0f, 0.95f};
         const float gain[3] = {1.05f, 1.0f, 0.98f};
         auto rep = [&](const char* name, const std::function<void(Image&)>& op) {
-            const double ms = timeReps(
+            const Timing tm = timeReps(
                 [&] {
                     Image work = base;
                     op(work);
                     g_sink += work.data()[0];
                 },
                 reps);
-            std::printf("  %-22s %8.1f ms   %7.0f Mpix/s\n", name, ms, mpix / (ms / 1000.0));
+            std::printf("  %-22s %8.1f ms   %7.0f Mpix/s   [%.0f-%.0f ms]\n", name, tm.median,
+                        mpix / (tm.median / 1000.0), tm.best, tm.worst);
         };
         rep("3D LUT (33^3) apply", [&](Image& im) { lut.apply(im, pool); });
         rep("lift/gamma/gain", [&](Image& im) { color::liftGammaGain(im, pool, lift, gam, gain); });
         rep("ACES tone map", [&](Image& im) { color::toneMapACES(im, pool, 0.5f); });
+        rep("Reinhard tone map", [&](Image& im) { color::toneMapReinhard(im, pool, 0.5f); });
         rep("white balance", [&](Image& im) { color::whiteBalance(im, pool, 0.2f, -0.1f); });
+        rep("exposure", [&](Image& im) { color::exposure(im, pool, 0.75f); });
+        rep("brightness/contrast", [&](Image& im) { color::brightnessContrast(im, pool, 0.1f, 1.2f); });
+        rep("saturation", [&](Image& im) { color::saturation(im, pool, 1.3f); });
     }
     return 0;
 }

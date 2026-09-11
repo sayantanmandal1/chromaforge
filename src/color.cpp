@@ -28,12 +28,15 @@ void brightnessContrast(Image& img, ThreadPool& pool, float brightness, float co
     const int w = img.width();
     const int c = img.channels();
     const float offset = brightness * 255.0f;
+    // Pure function of one input byte, so the whole mapping has 256 distinct results.
+    std::array<uint8_t, 256> lut{};
+    for (int i = 0; i < 256; ++i) {
+        lut[static_cast<size_t>(i)] =
+            clampByte((static_cast<float>(i) - 128.0f) * contrast + 128.0f + offset);
+    }
     parallelFor(pool, 0, img.height(), [&](int y) {
         uint8_t* p = img.row(y);
-        for (int i = 0; i < w * c; ++i) {
-            const float v = (static_cast<float>(p[i]) - 128.0f) * contrast + 128.0f + offset;
-            p[i] = clampByte(v);
-        }
+        for (int i = 0; i < w * c; ++i) p[i] = lut[p[i]];
     });
 }
 
@@ -57,9 +60,13 @@ void exposure(Image& img, ThreadPool& pool, float stops) {
     const float scale = std::pow(2.0f, stops);
     const int w = img.width();
     const int c = img.channels();
+    std::array<uint8_t, 256> lut{};
+    for (int i = 0; i < 256; ++i) {
+        lut[static_cast<size_t>(i)] = clampByte(static_cast<float>(i) * scale);
+    }
     parallelFor(pool, 0, img.height(), [&](int y) {
         uint8_t* p = img.row(y);
-        for (int i = 0; i < w * c; ++i) p[i] = clampByte(p[i] * scale);
+        for (int i = 0; i < w * c; ++i) p[i] = lut[p[i]];
     });
 }
 
@@ -116,16 +123,24 @@ float linearToSrgb(float c) {
 void whiteBalance(Image& img, ThreadPool& pool, float temperature, float tint) {
     if (img.channels() != 3) return;
     // Warm (temperature > 0) lifts red and drops blue; tint > 0 lifts green.
-    const float gr = 1.0f + 0.5f * temperature;
-    const float gg = 1.0f + 0.5f * tint;
-    const float gb = 1.0f - 0.5f * temperature;
+    const float gain[3] = {1.0f + 0.5f * temperature,
+                           1.0f + 0.5f * tint,
+                           1.0f - 0.5f * temperature};
+    // Each channel is an independent per-byte gain, so one small table per channel.
+    std::array<std::array<uint8_t, 256>, 3> lut{};
+    for (int ch = 0; ch < 3; ++ch) {
+        for (int i = 0; i < 256; ++i) {
+            lut[static_cast<size_t>(ch)][static_cast<size_t>(i)] =
+                clampByte(static_cast<float>(i) * gain[ch]);
+        }
+    }
     const int w = img.width();
     parallelFor(pool, 0, img.height(), [&](int y) {
         uint8_t* p = img.row(y);
         for (int x = 0; x < w; ++x) {
-            p[x * 3 + 0] = clampByte(p[x * 3 + 0] * gr);
-            p[x * 3 + 1] = clampByte(p[x * 3 + 1] * gg);
-            p[x * 3 + 2] = clampByte(p[x * 3 + 2] * gb);
+            p[x * 3 + 0] = lut[0][p[x * 3 + 0]];
+            p[x * 3 + 1] = lut[1][p[x * 3 + 1]];
+            p[x * 3 + 2] = lut[2][p[x * 3 + 2]];
         }
     });
 }
